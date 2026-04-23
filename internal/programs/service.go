@@ -1,10 +1,8 @@
 package programs
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,8 +10,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"golang.org/x/text/encoding/korean"
 )
 
 const appConfigDirName = "mycms"
@@ -55,6 +55,28 @@ type programState struct {
 	canReconnect bool
 	lastLogAt    time.Time
 	logs         *logBuffer
+}
+
+type processProbeResult struct {
+	pid int
+	ok  bool
+}
+
+type processScanContext struct {
+	candidates []processCandidate
+	candidateByPID map[int]processCandidate
+	candidatesByBase map[string][]processCandidate
+	candidatesByImagePath map[string][]processCandidate
+	probes     map[string]processProbeResult
+	snapshots  map[int]processSnapshot
+}
+
+type lineLogWriter struct {
+	service *Service
+	id      string
+	stream  string
+	mu      sync.Mutex
+	pending string
 }
 
 func WithRuntimeStore(store RuntimeStore) Option {
@@ -105,9 +127,15 @@ func (s *Service) ListPrograms(query ListQuery) ([]View, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	ctx := newProcessScanContext()
 	views := make([]View, 0, len(s.entries))
 	for _, entry := range s.entries {
-		view := s.viewForEntryLocked(entry)
+		state := s.stateForEntryLocked(entry.ID)
+		if !matchesEntryQuery(entry, state, query) {
+			continue
+		}
+
+		view := s.viewForEntryLocked(entry, ctx)
 		if !matchesQuery(view, query) {
 			continue
 		}
@@ -127,7 +155,7 @@ func (s *Service) GetProgram(id string) (View, error) {
 		return View{}, fmt.Errorf("프로그램 %q을(를) 찾을 수 없습니다", id)
 	}
 
-	return s.viewForEntryLocked(s.entries[index]), nil
+	return s.viewForEntryLocked(s.entries[index], newProcessScanContext()), nil
 }
 
 func (s *Service) ReconnectPrograms() error {
@@ -143,34 +171,24 @@ func (s *Service) ReconnectPrograms() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	ctx := newProcessScanContext()
 	for _, item := range document.Programs {
 		index := s.indexByIDLocked(item.ID)
 		if index < 0 {
 			continue
 		}
 
+		entry := s.entries[index]
 		state := s.ensureStateLocked(item.ID)
 		if item.CanReconnect {
-			if pid, ok := processPathLookup(item.Path); ok {
-				state.cmd = nil
-				state.pid = pid
-				state.startedAt = item.StartedAt
-				state.status = StatusRunning
-				state.lastError = ""
-				state.canReconnect = true
-				state.elevated = false
+			if pid, ok := ctx.probe(entry); ok {
+				s.applyRunningStateLocked(state, entry, pid, item.StartedAt, true)
 				continue
 			}
 		}
 
-		if item.CanReconnect && s.processLookup(item) {
-			state.cmd = nil
-			state.pid = item.PID
-			state.startedAt = item.StartedAt
-			state.status = StatusRunning
-			state.lastError = ""
-			state.canReconnect = true
-			state.elevated = false
+		if item.CanReconnect && item.PID > 0 && s.processLookup(item) && ctx.matchesPID(entry, item.PID) {
+			s.applyRunningStateLocked(state, entry, item.PID, item.StartedAt, false)
 			continue
 		}
 
@@ -208,7 +226,7 @@ func (s *Service) CreateProgram(input Input) (View, error) {
 		return View{}, err
 	}
 
-	return s.viewForEntryLocked(entry), nil
+	return s.viewForEntryLocked(entry, newProcessScanContext()), nil
 }
 
 func (s *Service) UpdateProgram(id string, input Input) (View, error) {
@@ -239,7 +257,7 @@ func (s *Service) UpdateProgram(id string, input Input) (View, error) {
 		return View{}, err
 	}
 
-	return s.viewForEntryLocked(entry), nil
+	return s.viewForEntryLocked(entry, newProcessScanContext()), nil
 }
 
 func (s *Service) DeleteProgram(id string) error {
@@ -277,7 +295,7 @@ func (s *Service) StartProgram(id string) error {
 	state := s.ensureStateLocked(id)
 	if state.cmd != nil {
 		s.mu.Unlock()
-		return errors.New("program is already running")
+		return errors.New("프로그램이 이미 실행 중입니다")
 	}
 
 	cmd := s.commandFactory(entry)
@@ -292,21 +310,10 @@ func (s *Service) StartProgram(id string) error {
 	}
 	applyCommandEnvironment(cmd, entry.Env)
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		state.status = StatusStopped
-		state.lastError = err.Error()
-		s.mu.Unlock()
-		return err
-	}
-
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		state.status = StatusStopped
-		state.lastError = err.Error()
-		s.mu.Unlock()
-		return err
-	}
+	stdoutWriter := &lineLogWriter{service: s, id: entry.ID, stream: "stdout"}
+	stderrWriter := &lineLogWriter{service: s, id: entry.ID, stream: "stderr"}
+	cmd.Stdout = stdoutWriter
+	cmd.Stderr = stderrWriter
 
 	state.status = StatusStarting
 	if err := cmd.Start(); err != nil {
@@ -331,9 +338,7 @@ func (s *Service) StartProgram(id string) error {
 	}
 	s.mu.Unlock()
 
-	go s.capturePipe(entry.ID, "stdout", stdout)
-	go s.capturePipe(entry.ID, "stderr", stderr)
-	go s.waitForExit(entry.ID, cmd)
+	go s.waitForExit(entry.ID, cmd, stdoutWriter, stderrWriter)
 	return nil
 }
 
@@ -343,13 +348,14 @@ func (s *Service) StopProgram(id string) error {
 
 	index := s.indexByIDLocked(id)
 	if index < 0 {
-		return fmt.Errorf("program %q was not found", id)
+		return fmt.Errorf("프로그램 %q을(를) 찾을 수 없습니다", id)
 	}
 
 	entry := s.entries[index]
 	state := s.ensureStateLocked(entry.ID)
 	if state.pid <= 0 {
-		if pid, ok := processPathLookup(entry.Path); ok {
+		ctx := newProcessScanContext()
+		if pid, ok := ctx.probe(entry); ok {
 			state.pid = pid
 		}
 	}
@@ -374,28 +380,33 @@ func (s *Service) StopProgram(id string) error {
 	state.status = StatusStopping
 	state.stopping = true
 	if err := killProcessByPID(state.pid); err != nil {
+		if !defaultProcessLookup(runtimeEntry{PID: state.pid}) {
+			state.lastExitAt = time.Now().UTC()
+			s.applyStoppedStateLocked(state, "", false)
+			if err := s.persistRuntimeLocked(); err != nil {
+				state.lastError = err.Error()
+			}
+			return nil
+		}
+
 		state.status = StatusOrphaned
 		state.stopping = false
-		state.lastError = err.Error()
+		state.lastError = classifyStopError(err)
 		return err
 	}
 
-	state.cmd = nil
-	state.pid = 0
-	state.canReconnect = false
-	state.elevated = false
 	state.lastExitAt = time.Now().UTC()
-	state.status = StatusStopped
-	state.stopping = false
-	state.lastError = ""
+	s.applyStoppedStateLocked(state, "", false)
 	if err := s.persistRuntimeLocked(); err != nil {
 		state.lastError = err.Error()
 	}
 	return nil
 }
 
-func (s *Service) waitForExit(id string, cmd *exec.Cmd) {
+func (s *Service) waitForExit(id string, cmd *exec.Cmd, stdoutWriter *lineLogWriter, stderrWriter *lineLogWriter) {
 	waitErr := cmd.Wait()
+	stdoutWriter.Flush()
+	stderrWriter.Flush()
 
 	s.mu.Lock()
 	state := s.ensureStateLocked(id)
@@ -432,15 +443,11 @@ func (s *Service) waitForExit(id string, cmd *exec.Cmd) {
 		return
 	}
 
-	state.status = StatusStopped
-
 	if waitErr != nil && !state.stopping {
-		state.lastError = summarizeProcessExit(waitErr, state.logs)
+		s.applyStoppedStateLocked(state, summarizeProcessExit(waitErr, state.logs), false)
+	} else {
+		s.applyStoppedStateLocked(state, "", false)
 	}
-	if state.stopping {
-		state.lastError = ""
-	}
-	state.stopping = false
 	if err := s.persistRuntimeLocked(); err != nil {
 		state.lastError = err.Error()
 	}
@@ -501,7 +508,7 @@ func (s *Service) normalizeInputLocked(excludeID string, input Input) (Entry, er
 		workingDirectory = filepath.Dir(path)
 	}
 	if stat, err := os.Stat(workingDirectory); err != nil || !stat.IsDir() {
-		return Entry{}, errors.New("작업 디렉터리는 존재하는 폴더여야 합니다")
+		return Entry{}, errors.New("작업 디렉터리는 존재하는 디렉터리여야 합니다")
 	}
 	if err := validateEnv(input.Env); err != nil {
 		return Entry{}, err
@@ -606,7 +613,141 @@ func (s *Service) shouldRestartLocked(entry Entry, state *programState, waitErr 
 	}
 }
 
-func (s *Service) viewForEntryLocked(entry Entry) View {
+func newProcessScanContext() *processScanContext {
+	candidates := processCandidatesProvider()
+	candidateByPID := make(map[int]processCandidate, len(candidates))
+	candidatesByBase := make(map[string][]processCandidate, 8)
+	candidatesByImagePath := make(map[string][]processCandidate, len(candidates))
+	for _, candidate := range candidates {
+		candidateByPID[candidate.pid] = candidate
+		base := candidateBaseName(candidate)
+		candidatesByBase[base] = append(candidatesByBase[base], candidate)
+		imagePath := normalizeComparablePath(candidate.imagePath)
+		if imagePath != "" {
+			candidatesByImagePath[imagePath] = append(candidatesByImagePath[imagePath], candidate)
+		}
+	}
+
+	return &processScanContext{
+		candidates: candidates,
+		candidateByPID: candidateByPID,
+		candidatesByBase: candidatesByBase,
+		candidatesByImagePath: candidatesByImagePath,
+		probes:     make(map[string]processProbeResult),
+		snapshots:  make(map[int]processSnapshot),
+	}
+}
+
+func (c *processScanContext) probe(entry Entry) (int, bool) {
+	if cached, ok := c.probes[entry.ID]; ok {
+		return cached.pid, cached.ok
+	}
+
+	if len(c.candidates) > 0 {
+		for _, candidate := range c.candidatesForEntry(entry) {
+			if matchProcessCandidate(entry, candidate) {
+				result := processProbeResult{pid: candidate.pid, ok: true}
+				c.probes[entry.ID] = result
+				return result.pid, true
+			}
+		}
+	}
+
+	pid, ok := processProbe(entry)
+	c.probes[entry.ID] = processProbeResult{pid: pid, ok: ok}
+	return pid, ok
+}
+
+func (c *processScanContext) snapshot(pid int) (processSnapshot, bool) {
+	if cached, ok := c.snapshots[pid]; ok {
+		return cached, true
+	}
+
+	snapshot, ok := processSnapshotByPID(pid)
+	if ok {
+		c.snapshots[pid] = snapshot
+	}
+	return snapshot, ok
+}
+
+func (c *processScanContext) candidatesForEntry(entry Entry) []processCandidate {
+	switch entry.Kind {
+	case KindExecutable:
+		path := normalizeComparablePath(entry.Path)
+		if path == "" {
+			return nil
+		}
+		return c.candidatesByImagePath[path]
+	case KindBatch, KindCommand:
+		return c.candidatesByBase["cmd.exe"]
+	case KindPowerShell:
+		candidates := append([]processCandidate(nil), c.candidatesByBase["powershell.exe"]...)
+		candidates = append(candidates, c.candidatesByBase["pwsh.exe"]...)
+		return candidates
+	default:
+		return c.candidates
+	}
+}
+
+func (c *processScanContext) matchesPID(entry Entry, pid int) bool {
+	candidate, ok := c.candidateByPID[pid]
+	if !ok {
+		return true
+	}
+	return matchProcessCandidate(entry, candidate)
+}
+
+func (s *Service) shouldProbeEntryLocked(state *programState) bool {
+	if state == nil {
+		return false
+	}
+	if state.cmd != nil || state.pid > 0 || state.canReconnect {
+		return true
+	}
+	switch state.status {
+	case StatusRunning, StatusStarting, StatusStopping, StatusOrphaned:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Service) applyRunningStateLocked(state *programState, entry Entry, pid int, startedAt time.Time, managed bool) {
+	state.cmd = nil
+	state.pid = pid
+	state.startedAt = startedAt
+	state.status = StatusRunning
+	state.lastError = ""
+	state.canReconnect = true
+	state.elevated = entry.RunAsAdmin && managed
+	state.stopping = false
+}
+
+func (s *Service) applyStoppedStateLocked(state *programState, lastError string, keepReconnect bool) {
+	state.cmd = nil
+	state.pid = 0
+	state.canReconnect = keepReconnect
+	state.elevated = false
+	state.status = StatusStopped
+	state.stopping = false
+	state.lastError = lastError
+	if state.lastExitAt.IsZero() {
+		state.lastExitAt = time.Now().UTC()
+	}
+}
+
+func classifyStopError(err error) string {
+	if err == nil {
+		return ""
+	}
+	lower := strings.ToLower(err.Error())
+	if strings.Contains(lower, "access is denied") {
+		return "프로세스를 종료할 수 없습니다. 접근이 거부되었습니다."
+	}
+	return err.Error()
+}
+
+func (s *Service) viewForEntryLocked(entry Entry, ctx *processScanContext) View {
 	state := s.stateForEntryLocked(entry.ID)
 	if state == nil {
 		state = &programState{status: StatusStopped}
@@ -616,12 +757,13 @@ func (s *Service) viewForEntryLocked(entry Entry) View {
 	canReconnect := state.canReconnect
 	lastError := state.lastError
 	startedAt := state.startedAt
+	launchMode := launchModeForEntry(entry)
 	memoryWorkingSetBytes := int64(0)
 	memoryPrivateBytes := int64(0)
 
-	if status == StatusRunning || status == StatusStarting || status == StatusStopping || status == StatusStopped || status == StatusOrphaned {
+	if s.shouldProbeEntryLocked(state) {
 		if pid <= 0 {
-			if foundPID, ok := processPathLookup(entry.Path); ok {
+			if foundPID, ok := ctx.probe(entry); ok {
 				pid = foundPID
 				if status == StatusStopped || status == StatusOrphaned {
 					status = StatusRunning
@@ -631,8 +773,8 @@ func (s *Service) viewForEntryLocked(entry Entry) View {
 			}
 		}
 
-		if pid > 0 {
-			if snapshot, ok := processSnapshotByPID(pid); ok {
+		if pid > 0 && (status == StatusRunning || status == StatusStarting || status == StatusStopping) {
+			if snapshot, ok := ctx.snapshot(pid); ok {
 				if !snapshot.startedAt.IsZero() {
 					startedAt = snapshot.startedAt
 				}
@@ -640,7 +782,6 @@ func (s *Service) viewForEntryLocked(entry Entry) View {
 				memoryPrivateBytes = snapshot.memoryPrivateBytes
 			}
 		}
-
 	}
 
 	return View{
@@ -651,6 +792,7 @@ func (s *Service) viewForEntryLocked(entry Entry) View {
 		Tags:                  append([]string(nil), entry.Tags...),
 		Path:                  entry.Path,
 		Kind:                  entry.Kind,
+		LaunchMode:            launchMode,
 		WorkingDirectory:      entry.WorkingDirectory,
 		Args:                  append([]string(nil), entry.Args...),
 		Env:                   append([]EnvVar(nil), entry.Env...),
@@ -793,6 +935,55 @@ func (s *Service) ClearProgramLogs(id string) error {
 	return nil
 }
 
+func matchesEntryQuery(entry Entry, state *programState, query ListQuery) bool {
+	search := strings.TrimSpace(strings.ToLower(query.Search))
+	if search != "" {
+		haystacks := []string{
+			entry.Name,
+			entry.Description,
+			entry.Notes,
+			entry.Path,
+			strings.Join(entry.Tags, " "),
+		}
+
+		matched := false
+		for _, candidate := range haystacks {
+			if strings.Contains(strings.ToLower(candidate), search) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+
+	if status := strings.TrimSpace(query.Status); status != "" {
+		currentStatus := StatusStopped
+		if state != nil && state.status != "" {
+			currentStatus = state.status
+		}
+		if !strings.EqualFold(currentStatus, status) {
+			return false
+		}
+	}
+
+	if tag := strings.TrimSpace(strings.ToLower(query.Tag)); tag != "" {
+		matched := false
+		for _, current := range entry.Tags {
+			if strings.EqualFold(current, tag) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+
+	return true
+}
+
 func matchesQuery(view View, query ListQuery) bool {
 	search := strings.TrimSpace(strings.ToLower(query.Search))
 	if search != "" {
@@ -877,30 +1068,68 @@ func compareTimestamp(left string, right string) int {
 	}
 }
 
-func (s *Service) capturePipe(id string, stream string, reader io.ReadCloser) {
-	defer reader.Close()
+func (w *lineLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		s.mu.Lock()
-		state := s.ensureStateLocked(id)
-		if state.logs == nil {
-			state.logs = newLogBuffer(500)
+	chunk := strings.ReplaceAll(decodeConsoleBytes(p), "\r\n", "\n")
+	chunk = strings.ReplaceAll(chunk, "\r", "\n")
+	w.pending += chunk
+
+	for {
+		newlineIndex := strings.IndexByte(w.pending, '\n')
+		if newlineIndex < 0 {
+			break
 		}
 
-		now := time.Now().UTC()
-		state.logs.Append(stream, scanner.Text(), now)
-		state.lastLogAt = now
-		s.mu.Unlock()
+		line := w.pending[:newlineIndex]
+		w.pending = w.pending[newlineIndex+1:]
+		w.service.appendLogLine(w.id, w.stream, line)
 	}
 
-	if err := scanner.Err(); err != nil {
-		s.mu.Lock()
-		state := s.ensureStateLocked(id)
-		state.lastError = err.Error()
-		s.mu.Unlock()
+	return len(p), nil
+}
+
+func decodeConsoleBytes(p []byte) string {
+	if len(p) == 0 {
+		return ""
 	}
+	if utf8.Valid(p) {
+		return string(p)
+	}
+
+	decoded, err := korean.EUCKR.NewDecoder().Bytes(p)
+	if err == nil && utf8.Valid(decoded) {
+		return string(decoded)
+	}
+
+	return string(p)
+}
+
+func (w *lineLogWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.pending == "" {
+		return
+	}
+
+	w.service.appendLogLine(w.id, w.stream, w.pending)
+	w.pending = ""
+}
+
+func (s *Service) appendLogLine(id string, stream string, line string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	state := s.ensureStateLocked(id)
+	if state.logs == nil {
+		state.logs = newLogBuffer(500)
+	}
+
+	now := time.Now().UTC()
+	state.logs.Append(stream, line, now)
+	state.lastLogAt = now
 }
 
 func applyCommandEnvironment(cmd *exec.Cmd, env []EnvVar) {

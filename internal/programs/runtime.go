@@ -28,6 +28,7 @@ type logBuffer struct {
 	truncated bool
 	entries   []LogEntry
 	total     int
+	lastRelevant map[string]string
 }
 
 func newLogBuffer(limit int) *logBuffer {
@@ -35,7 +36,10 @@ func newLogBuffer(limit int) *logBuffer {
 		limit = 500
 	}
 
-	return &logBuffer{limit: limit}
+	return &logBuffer{
+		limit:        limit,
+		lastRelevant: make(map[string]string, 2),
+	}
 }
 
 func (b *logBuffer) Append(stream string, line string, ts time.Time) {
@@ -43,6 +47,13 @@ func (b *logBuffer) Append(stream string, line string, ts time.Time) {
 		Stream:    stream,
 		Line:      line,
 		Timestamp: formatTimestamp(ts),
+	}
+
+	trimmed := strings.TrimSpace(line)
+	if trimmed != "" {
+		if scoreLogLine(trimmed) >= 0 {
+			b.lastRelevant[stream] = trimmed
+		}
 	}
 
 	b.total++
@@ -78,7 +89,15 @@ func (b *logBuffer) View(query LogQuery) LogView {
 }
 
 func (b *logBuffer) LastNonEmptyLine(stream string) string {
+	if stream != "" {
+		if line := strings.TrimSpace(b.lastRelevant[stream]); line != "" {
+			return line
+		}
+	}
+
 	fallback := ""
+	bestScore := -1
+	bestLine := ""
 
 	for index := len(b.entries) - 1; index >= 0; index-- {
 		entry := b.entries[index]
@@ -93,10 +112,42 @@ func (b *logBuffer) LastNonEmptyLine(stream string) string {
 		if fallback == "" {
 			fallback = line
 		}
-		if strings.Contains(strings.ToLower(line), "error:") {
-			return line
+
+		score := scoreLogLine(line)
+		if score > bestScore {
+			bestScore = score
+			bestLine = line
 		}
 	}
 
+	if bestLine != "" {
+		return bestLine
+	}
 	return fallback
+}
+
+func scoreLogLine(line string) int {
+	lower := strings.ToLower(strings.TrimSpace(line))
+	if lower == "" {
+		return -1
+	}
+
+	score := 0
+	if strings.Contains(lower, "error:") {
+		score += 100
+	}
+	if strings.Contains(lower, "cannot find") || strings.Contains(lower, "failed") || strings.Contains(lower, "exception") {
+		score += 80
+	}
+	if strings.Contains(lower, "module") || strings.Contains(lower, "denied") || strings.Contains(lower, "not found") {
+		score += 25
+	}
+	if strings.HasPrefix(lower, "at ") || strings.Contains(lower, "/loader.js:") || strings.Contains(lower, ".js:") {
+		score -= 40
+	}
+	if strings.Contains(lower, "exit status") {
+		score -= 20
+	}
+
+	return score
 }

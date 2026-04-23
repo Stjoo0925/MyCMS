@@ -1,11 +1,15 @@
 package programs
 
 import (
+	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/text/encoding/korean"
 )
 
 type fakeStore struct {
@@ -51,6 +55,19 @@ func TestServiceCreateProgramPersistsEntry(t *testing.T) {
 
 	if len(store.entries) != 1 {
 		t.Fatalf("saved entries = %d, want 1", len(store.entries))
+	}
+
+	if view.RestartPolicy != RestartPolicyNone {
+		t.Fatalf("CreateProgram().RestartPolicy = %q, want %q", view.RestartPolicy, RestartPolicyNone)
+	}
+	if view.RestartLimit != 0 {
+		t.Fatalf("CreateProgram().RestartLimit = %d, want 0", view.RestartLimit)
+	}
+	if view.RestartDelaySeconds != 0 {
+		t.Fatalf("CreateProgram().RestartDelaySeconds = %d, want 0", view.RestartDelaySeconds)
+	}
+	if view.RunAsAdmin {
+		t.Fatal("CreateProgram().RunAsAdmin = true, want false")
 	}
 }
 
@@ -176,12 +193,16 @@ func TestServiceDeleteProgramRemovesEntry(t *testing.T) {
 
 func TestServiceStartAndStopProgram(t *testing.T) {
 	store := &fakeStore{}
-	service, err := NewService(store, nil)
+	service, err := NewService(store, func(entry Entry) *exec.Cmd {
+		cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess", "--", "sleep")
+		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+		return cmd
+	})
 	if err != nil {
 		t.Fatalf("NewService() error = %v", err)
 	}
 
-	path := createBatchFile(t, "loop.bat", "@echo off\r\n:loop\r\nping -n 2 127.0.0.1 >nul\r\ngoto loop\r\n")
+	path := createBatchFile(t, "loop.bat", "@echo off\r\nexit /b 0\r\n")
 	entry, err := service.CreateProgram(Input{Name: "Looper", Path: path})
 	if err != nil {
 		t.Fatalf("CreateProgram() error = %v", err)
@@ -198,6 +219,33 @@ func TestServiceStartAndStopProgram(t *testing.T) {
 	}
 
 	waitForStatus(t, service, entry.ID, StatusStopped)
+}
+
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
+		return
+	}
+
+	if len(os.Args) < 3 {
+		os.Exit(0)
+	}
+
+	switch os.Args[len(os.Args)-1] {
+	case "sleep":
+		for {
+			time.Sleep(250 * time.Millisecond)
+		}
+	case "stderr-euckr":
+		encoded, err := korean.EUCKR.NewEncoder().Bytes([]byte(os.Getenv("GO_HELPER_STDERR_TEXT")))
+		if err != nil {
+			os.Exit(2)
+		}
+		_, _ = os.Stderr.Write(encoded)
+		_, _ = os.Stderr.Write([]byte("\n"))
+		os.Exit(1)
+	default:
+		os.Exit(0)
+	}
 }
 
 func TestServiceStartProgramForUnknownIDFails(t *testing.T) {
@@ -378,6 +426,41 @@ func TestServiceListProgramsFiltersBySearchTagAndStatus(t *testing.T) {
 	}
 }
 
+func TestServiceListProgramsPrefiltersBeforeProcessProbe(t *testing.T) {
+	store := &fakeStore{
+		entries: []Entry{
+			{ID: "one", Name: "Alpha Sync", Description: "nightly", Tags: []string{"ops"}, Path: `C:\tools\a.bat`, Kind: KindBatch, WorkingDirectory: `C:\tools`, RestartPolicy: RestartPolicyNone},
+			{ID: "two", Name: "Beta Report", Description: "finance", Tags: []string{"report"}, Path: `C:\tools\b.bat`, Kind: KindBatch, WorkingDirectory: `C:\tools`, RestartPolicy: RestartPolicyNone},
+		},
+	}
+	service, err := NewService(store, nil)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	originalProbe := processProbe
+	defer func() {
+		processProbe = originalProbe
+	}()
+
+	probeCalls := 0
+	processProbe = func(entry Entry) (int, bool) {
+		probeCalls++
+		return 0, false
+	}
+
+	got, err := service.ListPrograms(ListQuery{Search: "does-not-match"})
+	if err != nil {
+		t.Fatalf("ListPrograms() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("ListPrograms() = %#v, want no results", got)
+	}
+	if probeCalls != 0 {
+		t.Fatalf("processProbe calls = %d, want 0 for prefiltered query", probeCalls)
+	}
+}
+
 func TestServiceGetProgramReturnsRichView(t *testing.T) {
 	store := &fakeStore{}
 	service, err := NewService(store, nil)
@@ -404,6 +487,51 @@ func TestServiceGetProgramReturnsRichView(t *testing.T) {
 
 	if got.Description != "desc" || got.Notes != "memo" || len(got.Tags) != 1 {
 		t.Fatalf("GetProgram() = %#v", got)
+	}
+	if got.LaunchMode != "cmd" {
+		t.Fatalf("GetProgram().LaunchMode = %q, want %q", got.LaunchMode, "cmd")
+	}
+}
+
+func TestServiceUpdateProgramPreservesConfiguredRestartFields(t *testing.T) {
+	store := &fakeStore{}
+	service, err := NewService(store, nil)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	path := createBatchFile(t, "run.bat", "@echo off\r\nexit /b 0\r\n")
+	created, err := service.CreateProgram(Input{Name: "Runner", Path: path})
+	if err != nil {
+		t.Fatalf("CreateProgram() error = %v", err)
+	}
+
+	updated, err := service.UpdateProgram(created.ID, Input{
+		Name:                "Runner",
+		Path:                path,
+		RunAsAdmin:          true,
+		RestartPolicy:       RestartPolicyOnFailure,
+		RestartLimit:        3,
+		RestartDelaySeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("UpdateProgram() error = %v", err)
+	}
+
+	if updated.RunAsAdmin != true {
+		t.Fatal("UpdateProgram().RunAsAdmin = false, want true")
+	}
+	if updated.RestartPolicy != RestartPolicyOnFailure {
+		t.Fatalf("UpdateProgram().RestartPolicy = %q, want %q", updated.RestartPolicy, RestartPolicyOnFailure)
+	}
+	if updated.RestartLimit != 3 {
+		t.Fatalf("UpdateProgram().RestartLimit = %d, want 3", updated.RestartLimit)
+	}
+	if updated.RestartDelaySeconds != 5 {
+		t.Fatalf("UpdateProgram().RestartDelaySeconds = %d, want 5", updated.RestartDelaySeconds)
+	}
+	if updated.LaunchMode != "elevated" {
+		t.Fatalf("UpdateProgram().LaunchMode = %q, want %q", updated.LaunchMode, "elevated")
 	}
 }
 
@@ -498,6 +626,39 @@ func TestServicePrefersErrorLineOverTrailingStackFrame(t *testing.T) {
 	}
 }
 
+func TestServiceDecodesKoreanStderrFromWindowsEncoding(t *testing.T) {
+	store := &fakeStore{}
+	message := "설치 파일이 아닙니다."
+
+	service, err := NewService(store, func(entry Entry) *exec.Cmd {
+		cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess", "--", "stderr-euckr")
+		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1", "GO_HELPER_STDERR_TEXT="+message)
+		return cmd
+	})
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	path := createBatchFile(t, "stderr-euckr.bat", "@echo off\r\nexit /b 0\r\n")
+	entry, err := service.CreateProgram(Input{Name: "BrokenKo", Path: path})
+	if err != nil {
+		t.Fatalf("CreateProgram() error = %v", err)
+	}
+
+	if err := service.StartProgram(entry.ID); err != nil {
+		t.Fatalf("StartProgram() error = %v", err)
+	}
+	waitForStatus(t, service, entry.ID, StatusStopped)
+
+	view, err := service.GetProgram(entry.ID)
+	if err != nil {
+		t.Fatalf("GetProgram() error = %v", err)
+	}
+	if !strings.Contains(view.LastError, message) {
+		t.Fatalf("LastError = %q, want %q", view.LastError, message)
+	}
+}
+
 func TestServiceRestartsProgramOnFailureWhenPolicyRequiresIt(t *testing.T) {
 	store := &fakeStore{}
 	starts := 0
@@ -527,6 +688,51 @@ func TestServiceRestartsProgramOnFailureWhenPolicyRequiresIt(t *testing.T) {
 	waitForRestartCount(t, service, entry.ID, 1)
 	if starts < 2 {
 		t.Fatalf("starts = %d, want at least 2", starts)
+	}
+}
+
+func TestServiceDoesNotRestartProgramAfterUserStop(t *testing.T) {
+	store := &fakeStore{}
+	service, err := NewService(store, func(entry Entry) *exec.Cmd {
+		cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess", "--", "sleep")
+		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+		return cmd
+	})
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	path := createBatchFile(t, "run.bat", "@echo off\r\nexit /b 0\r\n")
+	entry, err := service.CreateProgram(Input{
+		Name:          "Forever",
+		Path:          path,
+		RestartPolicy: RestartPolicyAlways,
+		RestartLimit:  5,
+	})
+	if err != nil {
+		t.Fatalf("CreateProgram() error = %v", err)
+	}
+
+	if err := service.StartProgram(entry.ID); err != nil {
+		t.Fatalf("StartProgram() error = %v", err)
+	}
+	waitForStatus(t, service, entry.ID, StatusRunning)
+
+	if err := service.StopProgram(entry.ID); err != nil {
+		t.Fatalf("StopProgram() error = %v", err)
+	}
+	waitForStatus(t, service, entry.ID, StatusStopped)
+
+	time.Sleep(300 * time.Millisecond)
+	view, err := service.GetProgram(entry.ID)
+	if err != nil {
+		t.Fatalf("GetProgram() error = %v", err)
+	}
+	if view.RestartCount != 0 {
+		t.Fatalf("RestartCount = %d, want 0", view.RestartCount)
+	}
+	if view.Status != StatusStopped {
+		t.Fatalf("Status = %q, want %q", view.Status, StatusStopped)
 	}
 }
 
@@ -582,10 +788,12 @@ func TestServiceDetectsManuallyStartedProgramByPath(t *testing.T) {
 	}
 
 	originalLookup := processPathLookup
+	originalProbe := processProbe
 	originalSnapshot := processSnapshotByPID
 	originalKill := killProcessByPID
 	defer func() {
 		processPathLookup = originalLookup
+		processProbe = originalProbe
 		processSnapshotByPID = originalSnapshot
 		killProcessByPID = originalKill
 	}()
@@ -595,6 +803,12 @@ func TestServiceDetectsManuallyStartedProgramByPath(t *testing.T) {
 	snapshotTime := time.Date(2026, 4, 23, 12, 0, 0, 0, time.UTC)
 	processPathLookup = func(path string) (int, bool) {
 		if running && strings.EqualFold(path, `C:\tools\run.bat`) {
+			return 4242, true
+		}
+		return 0, false
+	}
+	processProbe = func(entry Entry) (int, bool) {
+		if running && strings.EqualFold(entry.Path, `C:\tools\run.bat`) {
 			return 4242, true
 		}
 		return 0, false
@@ -652,6 +866,103 @@ func TestServiceDetectsManuallyStartedProgramByPath(t *testing.T) {
 	}
 	if view.Status != StatusStopped {
 		t.Fatalf("Status after stop = %q, want %q", view.Status, StatusStopped)
+	}
+}
+
+func TestServiceUsesProcessProbeForWrappedBatchPrograms(t *testing.T) {
+	store := &fakeStore{
+		entries: []Entry{
+			{ID: "one", Name: "Runner", Path: `C:\tools\run.bat`, Kind: KindBatch, WorkingDirectory: `C:\tools`, RestartPolicy: RestartPolicyNone},
+		},
+	}
+	service, err := NewService(store, nil)
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	originalProbe := processProbe
+	defer func() {
+		processProbe = originalProbe
+	}()
+
+	processProbe = func(entry Entry) (int, bool) {
+		if entry.Kind == KindBatch && entry.Path == `C:\tools\run.bat` {
+			return 5150, true
+		}
+		return 0, false
+	}
+
+	service.mu.Lock()
+	service.states["one"].status = StatusOrphaned
+	service.states["one"].canReconnect = true
+	service.mu.Unlock()
+
+	view, err := service.GetProgram("one")
+	if err != nil {
+		t.Fatalf("GetProgram() error = %v", err)
+	}
+	if view.Status != StatusRunning {
+		t.Fatalf("Status = %q, want %q", view.Status, StatusRunning)
+	}
+	if view.PID != 5150 {
+		t.Fatalf("PID = %d, want 5150", view.PID)
+	}
+	if view.LaunchMode != "cmd" {
+		t.Fatalf("LaunchMode = %q, want %q", view.LaunchMode, "cmd")
+	}
+}
+
+func TestServiceClassifiesStopPermissionErrorForReconnectedProcess(t *testing.T) {
+	store := &fakeStore{}
+	service, err := NewService(store, func(entry Entry) *exec.Cmd {
+		cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcess", "--", "sleep")
+		cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+		return cmd
+	})
+	if err != nil {
+		t.Fatalf("NewService() error = %v", err)
+	}
+
+	path := createBatchFile(t, "run.bat", "@echo off\r\nexit /b 0\r\n")
+	entry, err := service.CreateProgram(Input{Name: "Runner", Path: path})
+	if err != nil {
+		t.Fatalf("CreateProgram() error = %v", err)
+	}
+	if err := service.StartProgram(entry.ID); err != nil {
+		t.Fatalf("StartProgram() error = %v", err)
+	}
+	waitForStatus(t, service, entry.ID, StatusRunning)
+
+	service.mu.Lock()
+	state := service.ensureStateLocked(entry.ID)
+	process := state.cmd.Process
+	state.cmd = nil
+	service.mu.Unlock()
+
+	originalKill := killProcessByPID
+	defer func() {
+		killProcessByPID = originalKill
+		_ = process.Kill()
+	}()
+
+	killProcessByPID = func(pid int) error {
+		return errors.New("TerminateProcess: Access is denied.")
+	}
+
+	err = service.StopProgram(entry.ID)
+	if err == nil {
+		t.Fatal("StopProgram() error = nil, want permission error")
+	}
+
+	view, getErr := service.GetProgram(entry.ID)
+	if getErr != nil {
+		t.Fatalf("GetProgram() error = %v", getErr)
+	}
+	if view.Status != StatusOrphaned {
+		t.Fatalf("Status = %q, want %q", view.Status, StatusOrphaned)
+	}
+	if !strings.Contains(view.LastError, "접근이 거부되었습니다") {
+		t.Fatalf("LastError = %q, want permission message", view.LastError)
 	}
 }
 

@@ -20,6 +20,27 @@ import {
 } from "./render.js";
 import { mountApplication } from "./template.js";
 
+function createProgramsSignature(programs) {
+  return JSON.stringify(
+    programs.map((program) => ({
+      id: program.id,
+      status: program.status,
+      lastError: program.lastError,
+      pid: program.pid,
+      startedAt: program.startedAt,
+      lastExitAt: program.lastExitAt,
+      memoryWorkingSetBytes: program.memoryWorkingSetBytes,
+      memoryPrivateBytes: program.memoryPrivateBytes,
+      restartCount: program.restartCount,
+      canReconnect: program.canReconnect,
+      updatedAt: program.updatedAt,
+      name: program.name,
+      path: program.path,
+      launchMode: program.launchMode,
+    })),
+  );
+}
+
 function splitCommaSeparated(value) {
   return String(value)
     .split(",")
@@ -38,7 +59,7 @@ function parseEnv(value) {
   return splitLines(value).map((line) => {
     const index = line.indexOf("=");
     if (index <= 0) {
-      throw new Error("환경 변수는 KEY=VALUE 형식이어야 합니다");
+      throw new Error("환경 변수는 KEY=VALUE 형식이어야 합니다.");
     }
 
     return {
@@ -54,6 +75,71 @@ function serializeLines(values) {
 
 function serializeEnv(values) {
   return (values ?? []).map((item) => `${item.key}=${item.value}`).join("\n");
+}
+
+function deriveWorkingDirectory(programPath) {
+  const normalized = String(programPath ?? "").trim().replaceAll("/", "\\");
+  if (!normalized) {
+    return "";
+  }
+
+  const lastSeparator = normalized.lastIndexOf("\\");
+  if (lastSeparator <= 0) {
+    return "";
+  }
+
+  return normalized.slice(0, lastSeparator);
+}
+
+function deriveProgramName(programPath) {
+  const normalized = String(programPath ?? "").trim().replaceAll("/", "\\");
+  if (!normalized) {
+    return "";
+  }
+
+  const lastSeparator = normalized.lastIndexOf("\\");
+  const filename = lastSeparator >= 0 ? normalized.slice(lastSeparator + 1) : normalized;
+  const lastDot = filename.lastIndexOf(".");
+  if (lastDot <= 0) {
+    return filename;
+  }
+
+  return filename.slice(0, lastDot);
+}
+
+function syncSuggestedFields(dom) {
+  const currentPath = dom.pathInputEl.value.trim();
+  if (!currentPath) {
+    return;
+  }
+
+  if (!dom.nameInputEl.value.trim()) {
+    dom.nameInputEl.value = deriveProgramName(currentPath);
+  }
+
+  if (!dom.workingDirectoryInputEl.value.trim()) {
+    dom.workingDirectoryInputEl.value = deriveWorkingDirectory(currentPath);
+  }
+}
+
+function hasAdvancedSettings(program) {
+  if (!program) {
+    return false;
+  }
+
+  const derivedWorkingDirectory = deriveWorkingDirectory(program.path);
+  return Boolean(
+    program.description ||
+      program.notes ||
+      program.tags?.length ||
+      (program.workingDirectory && program.workingDirectory !== derivedWorkingDirectory) ||
+      program.args?.length ||
+      program.env?.length ||
+      program.runAsAdmin ||
+      (program.restartPolicy && program.restartPolicy !== "none") ||
+      Number(program.restartLimit) > 0 ||
+      Number(program.restartDelaySeconds) > 0,
+  );
 }
 
 function readFormInput(dom) {
@@ -93,6 +179,7 @@ function setCreateDefaults(dom) {
   dom.restartLimitInputEl.value = "0";
   dom.restartDelaySecondsInputEl.value = "0";
   dom.runAsAdminInputEl.checked = false;
+  dom.advancedOptionsEl.open = false;
 }
 
 export function bootstrapApplication(root, options = {}) {
@@ -109,9 +196,14 @@ export function bootstrapApplication(root, options = {}) {
     refreshInFlight = (async () => {
       try {
         const programs = await listPrograms();
+        const nextSignature = createProgramsSignature(programs);
+        const shouldRender = !state.hasLoaded || state.programsSignature !== nextSignature;
         state.programs = programs;
+        state.programsSignature = nextSignature;
         state.hasLoaded = true;
-        renderPrograms(dom, state);
+        if (shouldRender) {
+          renderPrograms(dom, state);
+        }
 
         if (!refreshOptions.keepError) {
           setPageError(dom, state, "");
@@ -162,6 +254,7 @@ export function bootstrapApplication(root, options = {}) {
     try {
       payload = readFormInput(dom);
     } catch (error) {
+      dom.advancedOptionsEl.open = true;
       setFormError(dom, state, getErrorMessage(error));
       setFormBusy(dom, state, false);
       return;
@@ -192,6 +285,7 @@ export function bootstrapApplication(root, options = {}) {
       const path = await chooseProgramPath();
       if (path) {
         dom.pathInputEl.value = path;
+        syncSuggestedFields(dom);
       }
     } catch (error) {
       setFormError(dom, state, getErrorMessage(error));
@@ -205,6 +299,10 @@ export function bootstrapApplication(root, options = {}) {
     setFormMode(dom, state, "create");
     setCreateDefaults(dom);
     dom.nameInputEl.focus();
+  });
+
+  dom.pathInputEl.addEventListener("change", () => {
+    syncSuggestedFields(dom);
   });
 
   dom.cancelEditButtonEl.addEventListener("click", () => {
@@ -229,6 +327,13 @@ export function bootstrapApplication(root, options = {}) {
     const action = button.dataset.action;
     const program = state.programs.find((item) => item.id === id);
 
+    if (action === "open-create") {
+      setFormMode(dom, state, "create");
+      setCreateDefaults(dom);
+      dom.nameInputEl.focus();
+      return;
+    }
+
     if (!id || !action || !program) {
       return;
     }
@@ -236,6 +341,7 @@ export function bootstrapApplication(root, options = {}) {
     if (action === "edit") {
       setFormMode(dom, state, "edit", program);
       setFormValues(dom, program);
+      dom.advancedOptionsEl.open = hasAdvancedSettings(program);
       dom.nameInputEl.focus();
       return;
     }
@@ -245,13 +351,6 @@ export function bootstrapApplication(root, options = {}) {
       if (!confirmed) {
         return;
       }
-    }
-
-    if (action === "open-create") {
-      setFormMode(dom, state, "create");
-      setCreateDefaults(dom);
-      dom.nameInputEl.focus();
-      return;
     }
 
     if (action === "start") {

@@ -1,6 +1,9 @@
 export function createState() {
   return {
     programs: [],
+    programsSignature: "",
+    programCardMarkupCache: new Map(),
+    renderedProgramsMarkup: "",
     pageError: "",
     formError: "",
     formMode: "create",
@@ -42,29 +45,32 @@ function writeProgramToForm(dom, program) {
   dom.pathInputEl.value = program?.path ?? "";
   dom.workingDirectoryInputEl.value = program?.workingDirectory ?? "";
   dom.argsInputEl.value = (program?.args ?? []).join("\n");
-  dom.envInputEl.value = (program?.env ?? [])
-    .map((item) => `${item.key}=${item.value}`)
-    .join("\n");
+  dom.envInputEl.value = (program?.env ?? []).map((item) => `${item.key}=${item.value}`).join("\n");
   dom.runAsAdminInputEl.checked = Boolean(program?.runAsAdmin);
   dom.restartPolicyEl.value = program?.restartPolicy ?? "none";
   dom.restartLimitInputEl.value = String(program?.restartLimit ?? 0);
-  dom.restartDelaySecondsInputEl.value = String(
-    program?.restartDelaySeconds ?? 0,
-  );
+  dom.restartDelaySecondsInputEl.value = String(program?.restartDelaySeconds ?? 0);
+}
+
+function resetForm(dom) {
+  dom.formEl.reset();
+  dom.restartPolicyEl.value = "none";
+  dom.restartLimitInputEl.value = "0";
+  dom.restartDelaySecondsInputEl.value = "0";
+  dom.runAsAdminInputEl.checked = false;
+  dom.advancedOptionsEl.open = false;
 }
 
 export function setFormMode(dom, state, mode, program = null) {
   state.formMode = mode;
   state.editId = program?.id ?? "";
   state.panelOpen = true;
-  dom.panelTitleEl.textContent =
-    mode === "edit" ? "프로그램 수정" : "프로그램 추가";
+  dom.panelTitleEl.textContent = mode === "edit" ? "프로그램 수정" : "프로그램 추가";
   dom.panelDescriptionEl.textContent =
     mode === "edit"
       ? "상태 화면을 벗어나지 않고 이름이나 실행 경로를 수정할 수 있습니다."
       : "실행 파일을 등록하고 상태를 계속 확인할 수 있습니다.";
-  dom.submitButtonEl.textContent =
-    mode === "edit" ? "수정 저장" : "프로그램 저장";
+  dom.submitButtonEl.textContent = mode === "edit" ? "수정 저장" : "프로그램 저장";
   dom.cancelEditButtonEl.textContent = "닫기";
   dom.panelEl.classList.toggle("hidden", false);
   dom.panelBackdropEl.classList.toggle("hidden", false);
@@ -72,11 +78,7 @@ export function setFormMode(dom, state, mode, program = null) {
   if (program) {
     writeProgramToForm(dom, program);
   } else {
-    dom.formEl.reset();
-    dom.restartPolicyEl.value = "none";
-    dom.restartLimitInputEl.value = "0";
-    dom.restartDelaySecondsInputEl.value = "0";
-    dom.runAsAdminInputEl.checked = false;
+    resetForm(dom);
   }
 
   setFormError(dom, state, "");
@@ -88,21 +90,13 @@ export function closeFormPanel(dom, state) {
   state.editId = "";
   dom.panelEl.classList.toggle("hidden", true);
   dom.panelBackdropEl.classList.toggle("hidden", true);
-  dom.formEl.reset();
-  dom.restartPolicyEl.value = "none";
-  dom.restartLimitInputEl.value = "0";
-  dom.restartDelaySecondsInputEl.value = "0";
-  dom.runAsAdminInputEl.checked = false;
+  resetForm(dom);
   setFormError(dom, state, "");
 }
 
 export function updateSummary(dom, state) {
-  const running = state.programs.filter(
-    (program) => program.status === "RUNNING",
-  ).length;
-  const stopped = state.programs.filter(
-    (program) => program.status === "STOPPED",
-  ).length;
+  const running = state.programs.filter((program) => program.status === "RUNNING").length;
+  const stopped = state.programs.filter((program) => program.status === "STOPPED").length;
   const attention = state.programs.filter(
     (program) => Boolean(program.lastError) || program.status === "ORPHANED",
   ).length;
@@ -167,10 +161,7 @@ function getStatusLabel(status) {
 }
 
 function isBusyStatus(status) {
-  return (
-    normalizeStatus(status) === "STARTING" ||
-    normalizeStatus(status) === "STOPPING"
-  );
+  return normalizeStatus(status) === "STARTING" || normalizeStatus(status) === "STOPPING";
 }
 
 function isRunningStatus(status) {
@@ -201,8 +192,7 @@ function formatBytes(bytes) {
     unitIndex += 1;
   }
 
-  const display =
-    current >= 10 || unitIndex === 0 ? current.toFixed(0) : current.toFixed(1);
+  const display = current >= 10 || unitIndex === 0 ? current.toFixed(0) : current.toFixed(1);
   return `${display} ${units[unitIndex]}`;
 }
 
@@ -231,99 +221,152 @@ function formatElapsed(startedAt) {
   return `실행 ${seconds}초`;
 }
 
+function getProgramCardSignature(program, isPending) {
+  return JSON.stringify({
+    id: program.id,
+    name: program.name,
+    path: program.path,
+    kind: program.kind,
+    launchMode: program.launchMode,
+    restartPolicy: program.restartPolicy,
+    runAsAdmin: program.runAsAdmin,
+    tags: program.tags,
+    pid: program.pid,
+    startedAt: program.startedAt,
+    memoryWorkingSetBytes: program.memoryWorkingSetBytes,
+    status: program.status,
+    lastError: program.lastError,
+    isPending,
+  });
+}
+
+function buildProgramCardMarkup(program, isPending) {
+  const status = normalizeStatus(program.status);
+  const isRunning = isRunningStatus(status);
+  const isBusy = isPending || isBusyStatus(status);
+  const metaParts = [];
+
+  if (program.kind) {
+    metaParts.push(`<span class="meta-pill">${escapeHtml(program.kind)}</span>`);
+  }
+  if (program.launchMode) {
+    metaParts.push(`<span class="meta-pill">실행 ${escapeHtml(program.launchMode)}</span>`);
+  }
+  if (program.restartPolicy) {
+    metaParts.push(`<span class="meta-pill">재시작 ${escapeHtml(program.restartPolicy)}</span>`);
+  }
+  if (program.runAsAdmin) {
+    metaParts.push(`<span class="meta-pill">관리자 권한</span>`);
+  }
+  if (program.tags?.length) {
+    metaParts.push(`<span class="meta-pill">태그 ${escapeHtml(program.tags.join(", "))}</span>`);
+  }
+  if (program.pid > 0) {
+    metaParts.push(`<span class="meta-pill">PID ${escapeHtml(program.pid)}</span>`);
+  }
+  if (program.startedAt && status === "RUNNING") {
+    const runtime = formatElapsed(program.startedAt);
+    if (runtime) {
+      metaParts.push(`<span class="meta-pill">${escapeHtml(runtime)}</span>`);
+    }
+  }
+  if (program.memoryWorkingSetBytes > 0) {
+    const memory = formatBytes(program.memoryWorkingSetBytes);
+    if (memory) {
+      metaParts.push(`<span class="meta-pill">메모리 ${escapeHtml(memory)}</span>`);
+    }
+  }
+
+  const attentionMarkup = program.lastError
+    ? `<div class="card-error"><span class="error-label">확인 필요</span><p>${escapeHtml(program.lastError)}</p></div>`
+    : "";
+
+  return `
+    <article class="program-card program-card-${status.toLowerCase()}">
+      <div class="card-head">
+        <div class="card-copy">
+          <p class="card-kicker">프로그램</p>
+          <h3>${escapeHtml(program.name)}</h3>
+          <p class="path-text">${escapeHtml(program.path)}</p>
+          <div class="meta-row">${metaParts.join("")}</div>
+        </div>
+        <span class="status status-${status.toLowerCase()}">${getStatusLabel(status)}</span>
+      </div>
+
+      ${attentionMarkup}
+
+      <div class="card-actions">
+        <button data-action="start" data-id="${escapeHtml(program.id)}" ${!canStartStatus(status) || isBusy ? "disabled" : ""} class="btn-primary">시작</button>
+        <button data-action="stop" data-id="${escapeHtml(program.id)}" class="btn-secondary" ${!isRunning || isBusy ? "disabled" : ""}>중지</button>
+        <button data-action="edit" data-id="${escapeHtml(program.id)}" class="ghost-action" ${!canEditStatus(status) ? "disabled" : ""}>수정</button>
+        <button data-action="delete" data-id="${escapeHtml(program.id)}" class="btn-danger" ${!canEditStatus(status) ? "disabled" : ""}>삭제</button>
+      </div>
+    </article>
+  `;
+}
+
+function renderLoadingState(dom, state) {
+  state.renderedProgramsMarkup = `
+    <article class="program-skeleton"></article>
+    <article class="program-skeleton"></article>
+  `;
+  dom.programsEl.innerHTML = state.renderedProgramsMarkup;
+}
+
+function renderEmptyState(dom, state) {
+  state.programCardMarkupCache = new Map();
+  state.renderedProgramsMarkup = `
+    <article class="empty-state">
+      <p class="empty-kicker">등록된 프로그램이 없습니다</p>
+      <h3>첫 프로그램을 추가해 보세요</h3>
+      <p>이 화면에서 프로그램의 실행 여부를 바로 확인할 수 있도록 먼저 하나를 등록해 주세요.</p>
+      <button type="button" data-action="open-create" class="btn-primary">첫 프로그램 추가</button>
+    </article>
+  `;
+  dom.programsEl.innerHTML = state.renderedProgramsMarkup;
+}
+
 export function renderPrograms(dom, state) {
   const items = state.programs;
   updateSummary(dom, state);
   dom.programCountEl.textContent = `${items.length}개`;
 
   if (!state.hasLoaded) {
-    dom.programsEl.innerHTML = `
-      <article class="program-skeleton"></article>
-      <article class="program-skeleton"></article>
-    `;
+    renderLoadingState(dom, state);
     return;
   }
 
   if (items.length === 0) {
-    dom.programsEl.innerHTML = `
-      <article class="empty-state">
-        <p class="empty-kicker">등록된 프로그램이 없습니다</p>
-        <h3>첫 프로그램을 추가해 보세요</h3>
-        <p>이 화면에서 프로그램의 실행 여부를 바로 확인할 수 있도록 먼저 하나를 등록하세요.</p>
-        <button type="button" data-action="open-create" class="btn-primary">첫 프로그램 추가</button>
-      </article>
-    `;
+    renderEmptyState(dom, state);
     return;
   }
 
-  dom.programsEl.innerHTML = items
-    .map((program) => {
-      const status = normalizeStatus(program.status);
-      const isPending = state.pendingIds.has(program.id);
-      const isRunning = isRunningStatus(status);
-      const isBusy = isPending || isBusyStatus(status);
-      const metaParts = [];
+  const nextCache = new Map();
+  const parts = [];
 
-      if (program.kind) {
-        metaParts.push(
-          `<span class="meta-pill">${escapeHtml(program.kind)}</span>`,
-        );
-      }
-      if (program.restartPolicy) {
-        metaParts.push(
-          `<span class="meta-pill">재시작 ${escapeHtml(program.restartPolicy)}</span>`,
-        );
-      }
-      if (program.runAsAdmin) {
-        metaParts.push(`<span class="meta-pill">관리자 권한</span>`);
-      }
-      if (program.tags?.length) {
-        metaParts.push(
-          `<span class="meta-pill">태그 ${escapeHtml(program.tags.join(", "))}</span>`,
-        );
-      }
-      if (program.pid > 0) {
-        metaParts.push(`<span class="meta-pill">PID ${escapeHtml(program.pid)}</span>`);
-      }
-      if (program.startedAt && status === "RUNNING") {
-        const runtime = formatElapsed(program.startedAt);
-        if (runtime) {
-          metaParts.push(`<span class="meta-pill">${escapeHtml(runtime)}</span>`);
-        }
-      }
-      if (program.memoryWorkingSetBytes > 0) {
-        const memory = formatBytes(program.memoryWorkingSetBytes);
-        if (memory) {
-          metaParts.push(`<span class="meta-pill">메모리 ${escapeHtml(memory)}</span>`);
-        }
-      }
+  for (const program of items) {
+    const isPending = state.pendingIds.has(program.id);
+    const signature = getProgramCardSignature(program, isPending);
+    const cached = state.programCardMarkupCache.get(program.id);
 
-      const attentionMarkup = program.lastError
-        ? `<div class="card-error"><span class="error-label">확인 필요</span><p>${escapeHtml(program.lastError)}</p></div>`
-        : "";
+    if (cached?.signature === signature) {
+      nextCache.set(program.id, cached);
+      parts.push(cached.markup);
+      continue;
+    }
 
-      return `
-        <article class="program-card program-card-${status.toLowerCase()}">
-          <div class="card-head">
-            <div class="card-copy">
-              <p class="card-kicker">프로그램</p>
-              <h3>${escapeHtml(program.name)}</h3>
-              <p class="path-text">${escapeHtml(program.path)}</p>
-              <div class="meta-row">${metaParts.join("")}</div>
-            </div>
-            <span class="status status-${status.toLowerCase()}">${getStatusLabel(status)}</span>
-          </div>
+    const markup = buildProgramCardMarkup(program, isPending);
+    const cacheEntry = { signature, markup };
+    nextCache.set(program.id, cacheEntry);
+    parts.push(markup);
+  }
 
-          ${attentionMarkup}
+  const markup = parts.join("");
+  state.programCardMarkupCache = nextCache;
+  if (state.renderedProgramsMarkup === markup) {
+    return;
+  }
 
-          <div class="card-actions">
-            <button data-action="start" data-id="${escapeHtml(program.id)}" ${!canStartStatus(status) || isBusy ? "disabled" : ""} class="btn-primary">시작</button>
-            <button data-action="stop" data-id="${escapeHtml(program.id)}" class="btn-secondary" ${!isRunning || isBusy ? "disabled" : ""}>중지</button>
-            <button data-action="edit" data-id="${escapeHtml(program.id)}" class="ghost-action" ${!canEditStatus(status) ? "disabled" : ""}>수정</button>
-            <button data-action="delete" data-id="${escapeHtml(program.id)}" class="btn-danger" ${!canEditStatus(status) ? "disabled" : ""}>삭제</button>
-          </div>
-        </article>
-      `;
-    })
-    .join("");
+  state.renderedProgramsMarkup = markup;
+  dom.programsEl.innerHTML = markup;
 }

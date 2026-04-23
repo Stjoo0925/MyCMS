@@ -19,16 +19,27 @@ func detectKind(path string) (string, error) {
 		return KindPowerShell, nil
 	case ".py":
 		return KindPython, nil
-	case ".js":
-		return KindNode, nil
-	case ".mjs":
-		return KindNode, nil
-	case ".cjs":
+	case ".js", ".mjs", ".cjs":
 		return KindNode, nil
 	case ".jar":
 		return KindJar, nil
 	default:
-		return "", fmt.Errorf("경로는 지원되는 실행 파일 또는 스크립트를 가리켜야 합니다")
+		return "", fmt.Errorf("지원되지 않는 실행 파일 또는 스크립트입니다: %s", path)
+	}
+}
+
+func launchModeForEntry(entry Entry) string {
+	if entry.RunAsAdmin {
+		return "elevated"
+	}
+
+	switch entry.Kind {
+	case KindBatch, KindCommand:
+		return "cmd"
+	case KindPowerShell:
+		return "powershell"
+	default:
+		return "direct"
 	}
 }
 

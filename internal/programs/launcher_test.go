@@ -108,3 +108,40 @@ func TestBuildCommandOpensNewConsoleForBatchPrograms(t *testing.T) {
 		t.Fatalf("CreationFlags = %#x, want CREATE_NO_WINDOW", cmd.SysProcAttr.CreationFlags)
 	}
 }
+
+func TestLaunchModeForEntry(t *testing.T) {
+	cases := []struct {
+		name  string
+		entry Entry
+		want  string
+	}{
+		{
+			name:  "exe uses direct mode",
+			entry: Entry{Kind: KindExecutable},
+			want:  "direct",
+		},
+		{
+			name:  "batch uses cmd mode",
+			entry: Entry{Kind: KindBatch},
+			want:  "cmd",
+		},
+		{
+			name:  "powershell uses powershell mode",
+			entry: Entry{Kind: KindPowerShell},
+			want:  "powershell",
+		},
+		{
+			name:  "admin run uses elevated mode",
+			entry: Entry{Kind: KindBatch, RunAsAdmin: true},
+			want:  "elevated",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := launchModeForEntry(tc.entry); got != tc.want {
+				t.Fatalf("launchModeForEntry() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

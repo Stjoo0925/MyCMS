@@ -81,6 +81,7 @@ type View struct {
 	Tags                  []string `json:"tags"`
 	Path                  string   `json:"path"`
 	Kind                  string   `json:"kind"`
+	LaunchMode            string   `json:"launchMode"`
 	WorkingDirectory      string   `json:"workingDirectory"`
 	Args                  []string `json:"args"`
 	Env                   []EnvVar `json:"env"`

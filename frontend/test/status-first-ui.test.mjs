@@ -21,6 +21,8 @@ const shellRefs = mountApplication(root);
 assert.match(root.innerHTML, /summary-strip/);
 assert.match(root.innerHTML, /프로그램 추가/);
 assert.match(root.innerHTML, /프로그램 개요/);
+assert.match(root.innerHTML, /고급 실행 옵션/);
+assert.match(root.innerHTML, /이름과 실행 파일 경로만 입력하면 됩니다/);
 assert.match(root.innerHTML, /panel-backdrop/);
 assert.deepEqual(queriedSelectors, [
   "#page-error",
@@ -40,6 +42,7 @@ assert.deepEqual(queriedSelectors, [
   "#cancel-edit",
   "#create-button",
   "#choose-path",
+  "#advanced-options",
   "#name-input",
   "#description-input",
   "#notes-input",
@@ -70,6 +73,7 @@ assert.equal(shellRefs.submitButtonEl, selectorRefs.get("#submit-button"));
 assert.equal(shellRefs.cancelEditButtonEl, selectorRefs.get("#cancel-edit"));
 assert.equal(shellRefs.createButtonEl, selectorRefs.get("#create-button"));
 assert.equal(shellRefs.choosePathButtonEl, selectorRefs.get("#choose-path"));
+assert.equal(shellRefs.advancedOptionsEl, selectorRefs.get("#advanced-options"));
 assert.equal(shellRefs.nameInputEl, selectorRefs.get("#name-input"));
 assert.equal(shellRefs.descriptionInputEl, selectorRefs.get("#description-input"));
 assert.equal(shellRefs.notesInputEl, selectorRefs.get("#notes-input"));
@@ -84,13 +88,21 @@ assert.equal(shellRefs.restartLimitInputEl, selectorRefs.get("#restart-limit-inp
 assert.equal(shellRefs.restartDelaySecondsInputEl, selectorRefs.get("#restart-delay-input"));
 
 function createMockElement() {
+  let innerHTMLValue = "";
   return {
     textContent: "",
-    innerHTML: "",
+    innerHTMLWrites: 0,
     value: "",
     checked: false,
     disabled: false,
     dataset: {},
+    get innerHTML() {
+      return innerHTMLValue;
+    },
+    set innerHTML(value) {
+      innerHTMLValue = value;
+      this.innerHTMLWrites += 1;
+    },
     classList: {
       values: new Set(),
       toggle(name, force) {
@@ -132,6 +144,7 @@ function createDom() {
     cancelEditButtonEl: createMockElement(),
     createButtonEl: createMockElement(),
     choosePathButtonEl: createMockElement(),
+    advancedOptionsEl: createMockElement(),
     nameInputEl: createMockElement(),
     descriptionInputEl: createMockElement(),
     notesInputEl: createMockElement(),
@@ -167,7 +180,7 @@ renderPrograms(dom, state);
 assert.match(dom.programsEl.innerHTML, /program-skeleton/);
 
 state.programs = [
-  { id: "a", name: "Survey Sync", path: "C:/sync.bat", status: "RUNNING", lastError: "", pid: 4242, startedAt: "2026-04-23T12:00:00.000Z", memoryWorkingSetBytes: 134217728 },
+  { id: "a", name: "Survey Sync", path: "C:/sync.bat", launchMode: "cmd", status: "RUNNING", lastError: "", pid: 4242, startedAt: "2026-04-23T12:00:00.000Z", memoryWorkingSetBytes: 134217728 },
   { id: "b", name: "Nightly Backup", path: "D:/backup.bat", status: "STOPPED", lastError: "Exit code 1" },
   { id: "c", name: "Import Job", path: "E:/import.bat", status: "STARTING", lastError: "" },
   { id: "d", name: "Shutdown Job", path: "F:/shutdown.bat", status: "STOPPING", lastError: "" },
@@ -190,9 +203,14 @@ assert.match(dom.programsEl.innerHTML, /중지 중/);
 assert.match(dom.programsEl.innerHTML, /연결 끊김/);
 assert.match(dom.programsEl.innerHTML, /PID 4242/);
 assert.match(dom.programsEl.innerHTML, /메모리/);
+assert.match(dom.programsEl.innerHTML, /실행 cmd/);
 assert.match(dom.programsEl.innerHTML, /실행/);
 assert.match(dom.programsEl.innerHTML, /card-actions/);
 assert.doesNotMatch(dom.programsEl.innerHTML, /card-secondary-actions/);
+
+const renderWriteCount = dom.programsEl.innerHTMLWrites;
+renderPrograms(dom, state);
+assert.equal(dom.programsEl.innerHTMLWrites, renderWriteCount);
 
 state.programs = [];
 renderPrograms(dom, state);

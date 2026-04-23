@@ -160,6 +160,7 @@ export namespace programs {
 	    tags: string[];
 	    path: string;
 	    kind: string;
+	    launchMode: string;
 	    workingDirectory: string;
 	    args: string[];
 	    env: EnvVar[];
@@ -194,6 +195,7 @@ export namespace programs {
 	        this.tags = source["tags"];
 	        this.path = source["path"];
 	        this.kind = source["kind"];
+	        this.launchMode = source["launchMode"];
 	        this.workingDirectory = source["workingDirectory"];
 	        this.args = source["args"];
 	        this.env = this.convertValues(source["env"], EnvVar);

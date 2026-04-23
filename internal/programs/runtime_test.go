@@ -23,3 +23,14 @@ func TestLogBufferKeepsMostRecentEntries(t *testing.T) {
 		t.Fatal("Truncated = false, want true")
 	}
 }
+
+func TestLogBufferLastNonEmptyLineKeepsKoreanMessage(t *testing.T) {
+	buffer := newLogBuffer(5)
+	buffer.Append("stderr", "설치 파일이 아닙니다.", time.Unix(1, 0))
+	buffer.Append("stderr", "", time.Unix(2, 0))
+
+	got := buffer.LastNonEmptyLine("stderr")
+	if got != "설치 파일이 아닙니다." {
+		t.Fatalf("LastNonEmptyLine() = %q, want %q", got, "설치 파일이 아닙니다.")
+	}
+}

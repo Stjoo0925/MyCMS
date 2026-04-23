@@ -28,14 +28,27 @@ function createClassList() {
 }
 
 function createElement() {
+  let innerHTMLValue = "";
   return {
     textContent: "",
-    innerHTML: "",
+    innerHTMLWrites: 0,
     value: "",
     disabled: false,
+    checked: false,
+    open: false,
     classList: createClassList(),
-    addEventListener() {},
+    listeners: new Map(),
+    addEventListener(type, handler) {
+      this.listeners.set(type, handler);
+    },
     focus() {},
+    get innerHTML() {
+      return innerHTMLValue;
+    },
+    set innerHTML(value) {
+      innerHTMLValue = value;
+      this.innerHTMLWrites += 1;
+    },
   };
 }
 
@@ -47,6 +60,9 @@ const root = {
       const element = createElement();
       if (selector === "#panel" || selector === "#panel-backdrop") {
         element.classList.toggle("hidden", true);
+      }
+      if (selector === "#program-form") {
+        element.reset = () => {};
       }
       refs.set(selector, element);
     }
@@ -76,7 +92,7 @@ globalThis.window = {
         DeleteProgram: async () => undefined,
         StartProgram: async () => undefined,
         StopProgram: async () => undefined,
-        ChooseProgramPath: async () => "",
+        ChooseProgramPath: async () => "C:\\tools\\ghost-app.bat",
       },
     },
   },
@@ -94,3 +110,15 @@ await app.ready;
 assert.equal(app.state.panelOpen, false);
 assert.equal(refs.get("#panel").classList.contains("hidden"), true);
 assert.equal(refs.get("#panel-backdrop").classList.contains("hidden"), true);
+
+refs.get("#create-button").listeners.get("click")();
+assert.equal(refs.get("#advanced-options").open, false);
+
+await refs.get("#choose-path").listeners.get("click")();
+assert.equal(refs.get("#path-input").value, "C:\\tools\\ghost-app.bat");
+assert.equal(refs.get("#name-input").value, "ghost-app");
+assert.equal(refs.get("#working-directory-input").value, "C:\\tools");
+
+const renderCount = refs.get("#programs").innerHTMLWrites;
+await app.refreshPrograms();
+assert.equal(refs.get("#programs").innerHTMLWrites, renderCount);
