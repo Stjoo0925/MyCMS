@@ -1,0 +1,52 @@
+{
+  "name": "mycms",
+  "assetdir": "frontend/dist",
+  "frontend:build": "npm run build",
+  "frontend:install": "npm install",
+  "frontend:dev": "npm run dev",
+  "frontend:dev:build": "npm run build",
+  "frontend:dev:install": "npm install",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "http://127.0.0.1:4173",
+  "wailsjsdir": "frontend/wailsjs",
+  "version": "2",
+  "projectdir": "C:\\Users\\yusco\\OneDrive\\바탕 화면\\mycms",
+  "build:dir": "C:\\Users\\yusco\\OneDrive\\바탕 화면\\mycms\\build",
+  "build:tags": "",
+  "outputfilename": "mycms.exe",
+  "OutputType": "",
+  "Platform": "",
+  "runNonNativeBuildHooks": false,
+  "postBuildHooks": null,
+  "preBuildHooks": {
+    "windows/*": "powershell -NoProfile -Command Copy-Item -LiteralPath ..\\\\..\\\\assets\\\\appicon.png -Destination ..\\\\appicon.png -Force"
+  },
+  "Author": {
+    "name": "stjoo0925",
+    "email": "stjoo0925@gmail.com"
+  },
+  "Info": {
+    "companyName": "mycms",
+    "productName": "mycms",
+    "productVersion": "1.0.0",
+    "copyright": "\uBA85\uB839\uC904 \uD504\uB85C\uADF8\uB7A8 \uAD00\uB9AC \uC2DC\uC2A4\uD15C",
+    "comments": "\uBA85\uB839\uC904 \uD504\uB85C\uADF8\uB7A8 \uAD00\uB9AC \uC2DC\uC2A4\uD15C",
+    "fileAssociations": null,
+    "protocols": null
+  },
+  "debounceMS": 100,
+  "devServer": "localhost:34115",
+  "appargs": "",
+  "nsisType": "multiple",
+  "obfuscated": false,
+  "garbleargs": "",
+  "frontend:dir": "frontend",
+  "viteServerTimeout": 10,
+  "bindings": {
+    "ts_generation": {
+      "prefix": "",
+      "suffix": "",
+      "outputType": ""
+    }
+  }
+}
